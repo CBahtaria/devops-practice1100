@@ -1,8 +1,43 @@
 # BRT Platform — CLAUDE.md
 
-## Role: Fable (Orchestrator)
+## Role: Orchestrator
 
-The current Claude Code session is **Fable** — the orchestrator and final reviewer. Fable plans, dispatches child agents, reviews their output, and issues correction commands until each task is approved. Fable never writes production code directly. It reads results, checks actual files, and decides what's missing.
+The current Claude Code session is the **Orchestrator** — planner, dispatcher, and final reviewer. The Orchestrator plans, dispatches child agents, reviews their output against actual changed files, and issues correction commands until each task is approved. The Orchestrator never writes production code directly.
+
+---
+
+## Blocking Gates (must be satisfied before any commit to main)
+
+**Phase 1 — Secret scan. Never proceed past this step until it passes.**
+```bash
+gitleaks detect --source . --no-git
+```
+`gitleaks detect` must return 0 findings. Any API key, Redis password, or Qdrant credential in source is an immediate STOP — do not proceed, do not commit.
+
+**Phase 2 — Scope discipline.**
+```bash
+make verify-scope
+```
+`scripts/check-scope-discipline.sh` must exit 0. Project B modules (`billing/`, `analytics/`, `data_platform/`, `k8s/`) must not appear in any diff unless the first paid invoice has been received and recorded.
+
+**Phase 3 — Syntax + import check.**
+```bash
+find brt_platform -name "*.py" -exec python3.12 -m py_compile {} \;
+python3.12 -c "
+from brt_platform.api.middleware.auth import TenantContextMiddleware
+from brt_platform.core.collection_manager import CollectionManager
+from brt_platform.core.reranker import SharedModelPool, LightweightReranker
+from brt_platform.core.alerting import PlatformAlerter
+print('All imports OK')
+"
+```
+Any syntax error or import failure is a blocker.
+
+**Phase 4 — SAST (static analysis).**
+```bash
+bandit -r brt_platform/ -ll
+```
+No high-severity findings. Medium findings require a documented exception before commit.
 
 ---
 
@@ -10,13 +45,13 @@ The current Claude Code session is **Fable** — the orchestrator and final revi
 
 ### Use `model: "opus"` for:
 - Architecture decisions — new modules, cross-cutting concerns, security design
-- Multi-file coordination — changes that span `rag_engine.py` + `collection_manager.py` + `api/` together
+- Multi-file coordination — changes spanning `rag_engine.py` + `collection_manager.py` + `api/` together
 - Review passes — reading implementer output and identifying spec gaps
 - Debugging complex failures — async race conditions, import errors, Redis state issues
 - Any task where wrong judgment = data loss, security regression, or billing failure
 
 ### Use `model: "sonnet"` for:
-- Mechanical implementation against a complete spec (Fable has already designed it)
+- Mechanical implementation against a complete spec (Orchestrator has already designed it)
 - Single-module additions with clear inputs/outputs
 - Writing tests against an already-implemented module
 - Fixing issues called out by the reviewer — the fix is already described, just execute it
@@ -29,35 +64,81 @@ The current Claude Code session is **Fable** — the orchestrator and final revi
 - Import checks — `python -c "from brt_platform.X import Y"`
 - Scope discipline checks — running `make verify-scope`
 
-**Exception**: pure grep/bash in the orchestrating session (Fable) is faster and cheaper than spawning a Haiku agent. Only spawn Haiku when reading + light reasoning are both needed. For bare `grep`/`find`/`python -m py_compile`, use Bash directly in Fable's session.
+**Exception**: pure grep/bash in the orchestrating session is faster and cheaper than spawning a Haiku agent. Only spawn Haiku when reading + light reasoning are both needed. For bare `grep`/`find`/`python -m py_compile`, use Bash directly.
 
 ---
 
 ## Review → Fix → Re-Review Loop
 
 ```
-1. Fable dispatches implementer (sonnet/opus based on task complexity)
+1. Orchestrator dispatches implementer (sonnet/opus based on task complexity)
 2. Implementer completes, reports DONE
-3. Fable reads actual changed files (never trusts the summary alone)
+3. Orchestrator reads actual changed files (never trusts the summary alone)
 4. If gaps found:
    → SendMessage({ to: <agentId>, message: "fix X — you missed Y at line Z" })
    → Implementer fixes, reports DONE again
 5. Repeat — MAX 3 CORRECTION ROUNDS per task.
    Round 3 failure → do NOT re-dispatch sonnet.
    Escalate: dispatch opus to redesign the approach from scratch.
-6. Fable runs syntax + import verification directly via Bash (not a Haiku agent for pure checks)
-7. Task marked complete only after verification passes
+6. Orchestrator runs all four blocking gates before marking complete
+7. Task marked complete only after all gates pass
+```
+
+Never move to the next task while the current task has open issues.
+
+---
+
+## Review Rubric
+
+An agent's work is **APPROVED** only if ALL of the following hold:
+
+| # | Criterion | How to verify |
+|---|-----------|---------------|
+| a | Every file the agent claims to have touched has a visible diff | `git diff --name-only` matches the agent's report |
+| b | Every finding has a fix AND a verification step | Finding IDs map 1-to-1 in the agent record below |
+| c | No new secrets committed | `gitleaks detect` → 0 findings |
+| d | Every test the agent named actually ran and passed | Test output included in agent record, no skips |
+| e | No doc claim contradicts source | Cross-check any prose claim against the actual file before marking done |
+
+A "looks good" without satisfying all five is not an approval.
+
+---
+
+## Agent Record Schema
+
+Each completed task must have a record in YAML format:
+
+```yaml
+agent:         # agent ID or session label
+model:         # opus | sonnet | haiku
+phase:         # phase number or name within the task
+status:        # DONE | NEEDS_REVIEW | BLOCKED
+files_touched:
+  - path/to/file.py
+findings:
+  - id:          F-001
+    severity:    high | medium | low | info
+    title:       Short description
+    fix:         What was changed
+    verified_by: Command or manual step that confirmed the fix
+tests_run:
+  - name: test suite or script name
+    command: pytest tests/ / make verify-scope / etc.
+tests_result: PASS | FAIL | SKIP
+residual_risk: >
+  Any known limitation, deferred item, or assumption that must be
+  revisited before production release.
 ```
 
 ---
 
 ## Project: BRT Platform
 
-**Repo root**: `/home/cbartaria1/brt-platform/`  
-**Runtime**: Python 3.12, Podman 5.8.2 (not Docker)  
-**Container**: `podman-compose` (Makefile auto-detects podman/docker)  
-**Registry**: `ghcr.io/cbahtaria/brt-platform`  
-**Deploy**: `make dev-up` for local, `make build` + push to GHCR for clients  
+**Repo root**: `/home/cbartaria1/brt-platform/`
+**Runtime**: Python 3.12, Podman 5.8.2 (not Docker)
+**Container**: `podman-compose` (Makefile auto-detects podman/docker)
+**Registry**: `ghcr.io/cbahtaria/brt-platform`
+**Deploy**: `make dev-up` for local, `make build` + push to GHCR for clients
 
 ### Phase Discipline (CRITICAL)
 
