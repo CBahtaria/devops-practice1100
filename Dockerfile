@@ -1,5 +1,5 @@
 # Stage 1: Builder — installs deps and pre-warms embedding model
-FROM python:3.12-slim AS builder
+FROM python:3.14-slim AS builder
 ARG EMBEDDING_MODEL=BAAI/bge-large-en-v1.5
 ARG CACHE_BUST=1
 
@@ -16,7 +16,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # Stage 2: Runtime — production, non-root, read-only-safe
-FROM python:3.12-slim AS runtime
+FROM python:3.14-slim AS runtime
 
 RUN adduser --uid 10001 --disabled-password --gecos "" brt
 
